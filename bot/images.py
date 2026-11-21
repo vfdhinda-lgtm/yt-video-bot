@@ -26,6 +26,11 @@ def _fit(img_bytes, path, size=(W, H)):
 
 
 _cf_mode = [0]  # which request shape Cloudflare accepted last time
+_cf_off = [False]  # True after Cloudflare says the daily free limit is used up
+
+
+class LimitReached(Exception):
+    pass
 
 
 def _cloudflare(prompt, seed):
@@ -41,6 +46,9 @@ def _cloudflare(prompt, seed):
             _cf_mode[0] = i
             return base64.b64decode(r.json()["result"]["image"])
         last = f"Cloudflare {r.status_code}: {r.text[:300]}"
+        if r.status_code == 429 or "daily free allocation" in r.text:
+            _cf_off[0] = True
+            raise LimitReached("Cloudflare daily free limit used up - using Pollinations for the rest of this video")
         if r.status_code != 400:
             break
     raise RuntimeError(last)
@@ -82,12 +90,16 @@ def scene_seed(scene, base_seed, index):
 
 def make_image(prompt, path, seed, size=(W, H)):
     """Cloudflare first (if keys are set); if it keeps failing, Pollinations.ai as backup."""
-    services = ([_cloudflare] if os.environ.get("CF_ACCOUNT_ID") and os.environ.get("CF_API_TOKEN") else []) + [_pollinations]
+    use_cf = bool(os.environ.get("CF_ACCOUNT_ID") and os.environ.get("CF_API_TOKEN")) and not _cf_off[0]
+    services = ([_cloudflare] if use_cf else []) + [_pollinations]
     for service in services:
         for attempt in range(3):
             try:
                 _fit(service(prompt, seed), path, size)
                 return True
+            except LimitReached as e:
+                print(f"  {e}")
+                break
             except Exception as e:  # noqa: BLE001
                 wait = 10 * (attempt + 1)
                 print(f"  {service.__name__.strip('_')} try {attempt + 1} failed ({str(e)[:300]}); waiting {wait}s")
