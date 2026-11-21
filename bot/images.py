@@ -14,6 +14,7 @@ from PIL import Image
 from bot import config
 
 W, H = 1920, 1080
+STEPS = int(os.environ.get("CF_STEPS", "4"))  # fewer steps = less of the free daily limit used
 
 
 def _fit(img_bytes, path, size=(W, H)):
@@ -36,8 +37,8 @@ class LimitReached(Exception):
 def _cloudflare(prompt, seed):
     acc = os.environ["CF_ACCOUNT_ID"]
     url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    shapes = [{"prompt": prompt[:2000], "steps": 8, "seed": seed},   # full
-              {"prompt": prompt[:2000], "steps": 8},                 # without seed
+    shapes = [{"prompt": prompt[:2000], "steps": STEPS, "seed": seed},   # full
+              {"prompt": prompt[:2000], "steps": STEPS},             # without seed
               {"prompt": prompt[:1000]}]                              # minimal
     last = ""
     for i in range(_cf_mode[0], len(shapes)):
@@ -108,23 +109,35 @@ def make_image(prompt, path, seed, size=(W, H)):
 
 
 def make_all(meta, folder, base_seed, progress=None):
+    """Creates at most MAX_IMAGES different images (default 20) to stay inside the free Cloudflare limit.
+    When a video has more scenes, neighbouring scenes share an image (each scene still gets its own
+    zoom/pan movement, so it does not look repeated)."""
     scenes, chars = meta["scenes"], meta.get("characters", [])
-    paths, last_good, failed = [], None, 0
+    n = len(scenes)
+    cap = max(5, int(os.environ.get("MAX_IMAGES", "20")))
+    groups = min(n, cap)
+    group_of = [i * groups // n for i in range(n)]            # scene -> image number
+    first_scene = {}
+    for i, g in enumerate(group_of):
+        first_scene.setdefault(g, i)
+    made, last_good, failed = {}, None, 0
     delay = float(os.environ.get("IMAGE_DELAY", "4"))
-    for i, s in enumerate(scenes):
-        p = os.path.join(folder, f"img_{i:03d}.jpg")
-        print(f"Image {i + 1}/{len(scenes)}")
-        if progress and i % 5 == 0:
-            progress(f"Images {i + 1}/{len(scenes)}")
+    for g in range(groups):
+        i = first_scene[g]
+        s = scenes[i]
+        p = os.path.join(folder, f"img_{g:03d}.jpg")
+        print(f"Image {g + 1}/{groups}")
+        if progress and g % 5 == 0:
+            progress(f"Images {g + 1}/{groups}")
         if make_image(build_prompt(s["image_prompt"], chars), p, scene_seed(s, base_seed, i)):
             last_good = p
         else:
             failed += 1
             if last_good is None:
-                raise RuntimeError("First image could not be made. Check the image service.")
+                raise RuntimeError("First image could not be made. Check the image service (free limit may be used up for today).")
             p = last_good
-        paths.append(p)
+        made[g] = p
         time.sleep(delay)
-    if failed > len(scenes) * 0.3:
-        raise RuntimeError(f"{failed} images failed; stopping so a bad video is not uploaded.")
-    return paths
+    if failed > groups * 0.3:
+        raise RuntimeError(f"{failed} of {groups} images failed; stopping so a bad video is not uploaded.")
+    return [made[g] for g in group_of]
