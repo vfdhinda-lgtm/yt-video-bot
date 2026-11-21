@@ -61,40 +61,80 @@ Do NOT use any of these already-made titles:
 Return only the title text, nothing else."""
 
 
-def gemini(prompt, json_mode=False):
+def _gemini_once(model, prompt, json_mode, timeout):
+    """One call to one Gemini model. Returns text, or raises _Skip / _Busy."""
     key = os.environ["GEMINI_API_KEY"]
-    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.9,
-                                 "thinkingConfig": {"thinkingLevel": "low"}}}
+    cfg = {"temperature": 0.9, "thinkingConfig": {"thinkingLevel": "low"}}
     if json_mode:
-        body["generationConfig"]["responseMimeType"] = "application/json"
-    for attempt in range(6):
+        cfg["responseMimeType"] = "application/json"
+    for _ in range(2):
         try:
-            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=900)
+            r = requests.post(url, headers={"x-goog-api-key": key}, timeout=timeout,
+                              json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg})
         except (requests.Timeout, requests.ConnectionError) as e:
-            print(f"Gemini slow/unreachable ({type(e).__name__}), retrying...")
-            time.sleep(20)
-            continue
+            raise _Busy(f"{model}: {type(e).__name__}")
         if r.status_code == 200:
-            parts = r.json()["candidates"][0]["content"]["parts"]
+            parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
             text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
             if text.strip():
                 return text
-            print("Gemini returned empty text, retrying...")
+            raise _Busy(f"{model}: empty answer")
+        if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in cfg:
+            cfg.pop("thinkingConfig")  # this model does not support thinkingLevel
             continue
-        if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in body["generationConfig"]:
-            print("Model does not accept thinkingLevel, retrying without it...")
-            body["generationConfig"].pop("thinkingConfig")
-            continue
-        if r.status_code in (429, 500, 502, 503, 504):
-            wait = 30 * (attempt + 1)
-            print(f"Gemini busy ({r.status_code}), waiting {wait}s...")
-            time.sleep(wait)
-            continue
-        raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:500]}")
-    raise RuntimeError("Gemini failed after several tries")
+        if r.status_code in (400, 403, 404):
+            raise _Skip(f"{model}: {r.status_code} {r.text[:150]}")
+        raise _Busy(f"{model}: {r.status_code}")
+    raise _Skip(f"{model}: rejected settings")
+
+
+def _cloudflare_llm(prompt):
+    """Backup writer: Cloudflare Workers AI (uses the same Cloudflare keys as the images)."""
+    acc, tok = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_API_TOKEN")
+    if not (acc and tok):
+        raise _Skip("Cloudflare keys not set")
+    model = os.environ.get("CF_TEXT_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+    r = requests.post(f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/{model}",
+                      headers={"Authorization": f"Bearer {tok}"}, timeout=600,
+                      json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 8000, "temperature": 0.8})
+    if r.status_code != 200:
+        raise _Busy(f"Cloudflare {r.status_code}: {r.text[:150]}")
+    res = r.json().get("result", {}).get("response", "")
+    return json.dumps(res) if isinstance(res, (dict, list)) else str(res)
+
+
+class _Busy(Exception):
+    pass
+
+
+class _Skip(Exception):
+    pass
+
+
+def gemini(prompt, json_mode=False):
+    """Ask AI. Tries several Gemini models (when one is overloaded, the next one usually works),
+    then Cloudflare as a backup. Repeats the whole round 3 times with a pause."""
+    first = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    models = [m for m in dict.fromkeys([first, "gemini-flash-latest", "gemini-3.8-flash-lite", "gemini-flash-lite-latest"]) if m]
+    errors = []
+    for round_no in range(3):
+        for m in models:
+            try:
+                return _gemini_once(m, prompt, json_mode, timeout=420)
+            except (_Busy, _Skip) as e:
+                errors.append(str(e))
+                print(f"AI not available: {e}")
+        try:
+            print("Trying Cloudflare AI as backup...")
+            return _cloudflare_llm(prompt)
+        except (_Busy, _Skip) as e:
+            errors.append(str(e))
+            print(f"Backup not available: {e}")
+        if round_no < 2:
+            print("All AI busy, waiting 2 minutes...")
+            time.sleep(120)
+    raise RuntimeError("All AI models busy. Last errors: " + " | ".join(errors[-4:]))
 
 
 def new_topic(done_titles):
