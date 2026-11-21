@@ -25,13 +25,25 @@ def _fit(img_bytes, path, size=(W, H)):
     img.crop((left, top, left + tw, top + th)).save(path, "JPEG", quality=92)
 
 
+_cf_mode = [0]  # which request shape Cloudflare accepted last time
+
+
 def _cloudflare(prompt, seed):
     acc = os.environ["CF_ACCOUNT_ID"]
     url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    r = requests.post(url, headers={"Authorization": f"Bearer {os.environ['CF_API_TOKEN']}"},
-                      json={"prompt": prompt[:2000], "steps": 8, "seed": seed}, timeout=180)
-    r.raise_for_status()
-    return base64.b64decode(r.json()["result"]["image"])
+    shapes = [{"prompt": prompt[:2000], "steps": 8, "seed": seed},   # full
+              {"prompt": prompt[:2000], "steps": 8},                 # without seed
+              {"prompt": prompt[:1000]}]                              # minimal
+    last = ""
+    for i in range(_cf_mode[0], len(shapes)):
+        r = requests.post(url, headers={"Authorization": f"Bearer {os.environ['CF_API_TOKEN']}"}, json=shapes[i], timeout=180)
+        if r.status_code == 200:
+            _cf_mode[0] = i
+            return base64.b64decode(r.json()["result"]["image"])
+        last = f"Cloudflare {r.status_code}: {r.text[:300]}"
+        if r.status_code != 400:
+            break
+    raise RuntimeError(last)
 
 
 def _pollinations(prompt, seed):
@@ -69,16 +81,17 @@ def scene_seed(scene, base_seed, index):
 
 
 def make_image(prompt, path, seed, size=(W, H)):
-    use_cf = bool(os.environ.get("CF_ACCOUNT_ID") and os.environ.get("CF_API_TOKEN"))
-    for attempt in range(4):
-        try:
-            data = _cloudflare(prompt, seed) if use_cf else _pollinations(prompt, seed)
-            _fit(data, path, size)
-            return True
-        except Exception as e:  # noqa: BLE001
-            wait = 15 * (attempt + 1)
-            print(f"  image try {attempt + 1} failed ({e}); waiting {wait}s")
-            time.sleep(wait)
+    """Cloudflare first (if keys are set); if it keeps failing, Pollinations.ai as backup."""
+    services = ([_cloudflare] if os.environ.get("CF_ACCOUNT_ID") and os.environ.get("CF_API_TOKEN") else []) + [_pollinations]
+    for service in services:
+        for attempt in range(3):
+            try:
+                _fit(service(prompt, seed), path, size)
+                return True
+            except Exception as e:  # noqa: BLE001
+                wait = 10 * (attempt + 1)
+                print(f"  {service.__name__.strip('_')} try {attempt + 1} failed ({str(e)[:300]}); waiting {wait}s")
+                time.sleep(wait)
     return False
 
 
