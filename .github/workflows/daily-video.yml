@@ -1,0 +1,63 @@
+name: Daily AI Video
+
+on:
+  schedule:
+    - cron: "17 11 * * *"   # roz 11:17 UTC = 4:47 PM India. Publish time panel ki Settings se.
+  workflow_dispatch:         # "Run workflow" button se kabhi bhi chala sakte ho
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-video
+  cancel-in-progress: false
+
+jobs:
+  make-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg and fonts
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Make and upload video
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          POLLINATIONS_TOKEN: ${{ secrets.POLLINATIONS_TOKEN }}
+          FREESOUND_API_KEY: ${{ secrets.FREESOUND_API_KEY }}
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          BOT_KEY: ${{ secrets.BOT_KEY }}
+          TRIGGER: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
+        run: python main.py
+
+      - name: Save finished topic
+        if: success()
+        run: |
+          git config user.name "video-bot"
+          git config user.email "video-bot@users.noreply.github.com"
+          git add done.txt
+          git commit -m "Video done" || echo "nothing to commit"
+          git push
+
+      - name: Keep video for download (3 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video
+          path: output/final/
+          retention-days: 3
+          if-no-files-found: ignore
