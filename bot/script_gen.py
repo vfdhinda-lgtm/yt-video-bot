@@ -66,14 +66,28 @@ def gemini(prompt, json_mode=False):
     model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.9}}
+            "generationConfig": {"temperature": 0.9,
+                                 "thinkingConfig": {"thinkingLevel": "low"}}}
     if json_mode:
         body["generationConfig"]["responseMimeType"] = "application/json"
     for attempt in range(6):
-        r = requests.post(url, params={"key": key}, json=body, timeout=300)
+        try:
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=900)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            print(f"Gemini slow/unreachable ({type(e).__name__}), retrying...")
+            time.sleep(20)
+            continue
         if r.status_code == 200:
             parts = r.json()["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts)
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            if text.strip():
+                return text
+            print("Gemini returned empty text, retrying...")
+            continue
+        if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in body["generationConfig"]:
+            print("Model does not accept thinkingLevel, retrying without it...")
+            body["generationConfig"].pop("thinkingConfig")
+            continue
         if r.status_code in (429, 500, 502, 503, 504):
             wait = 30 * (attempt + 1)
             print(f"Gemini busy ({r.status_code}), waiting {wait}s...")
